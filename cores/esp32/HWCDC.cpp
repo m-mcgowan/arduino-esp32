@@ -387,7 +387,8 @@ static void hw_cdc_isr_handler(void *arg) {
   }
 
   if (usbjtag_intr_status & USB_SERIAL_JTAG_INTR_BUS_RESET) {
-    usb_serial_jtag_ll_clr_intsts_mask(USB_SERIAL_JTAG_INTR_BUS_RESET);
+    // Also drop an IN token latched before the reset: isCDC_Connected() samples its raw status.
+    usb_serial_jtag_ll_clr_intsts_mask(USB_SERIAL_JTAG_INTR_BUS_RESET | USB_SERIAL_JTAG_INTR_TOKEN_REC_IN_EP1);
     arduino_hw_cdc_event_post(ARDUINO_HW_CDC_EVENTS, ARDUINO_HW_CDC_BUS_RESET_EVENT, &event, sizeof(arduino_hw_cdc_event_data_t), &xTaskWoken);
     portENTER_CRITICAL_ISR(&hw_cdc_tx_mux);
     tx_stash_len = 0;
@@ -455,8 +456,18 @@ bool HWCDC::isCDC_Connected() {
   int64_t now = 0;
   int64_t token_us = 0;
   bool open = false;
+  // The IN-token interrupt stays off (a host with the port open polls continuously, one
+  // interrupt per token), but its raw status bit still latches: a token since the last check
+  // counts as a token now. Clearing it makes the next check see only newer polling.
+  const bool polled = (usb_serial_jtag_ll_get_intraw_mask() & USB_SERIAL_JTAG_INTR_TOKEN_REC_IN_EP1) != 0;
+  if (polled) {
+    usb_serial_jtag_ll_clr_intsts_mask(USB_SERIAL_JTAG_INTR_TOKEN_REC_IN_EP1);
+  }
   portENTER_CRITICAL_SAFE(&hw_cdc_tx_mux);
   now = esp_timer_get_time();
+  if (polled) {
+    last_in_token_us = now;
+  }
   token_us = last_in_token_us;
   const bool prev_connected = connected;
   const bool live_tx = last_tx_taken_us != 0;
@@ -698,8 +709,10 @@ void HWCDC::begin(unsigned long baud) {
   usb_serial_jtag_ll_clr_intsts_mask(USB_SERIAL_JTAG_LL_INTR_MASK & ~USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT);
   hw_cdc_set_connected(false);
   hw_cdc_reset_session();
-  intr_mask =
-    USB_SERIAL_JTAG_INTR_SERIAL_IN_EMPTY | USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT | USB_SERIAL_JTAG_INTR_BUS_RESET | USB_SERIAL_JTAG_INTR_TOKEN_REC_IN_EP1;
+  // No TOKEN_REC_IN_EP1 interrupt: a host with the port open polls the IN endpoint
+  // continuously, and one interrupt per token takes enough CPU to starve other work (a UART at
+  // 230400 baud overflowed at 80 MHz). isCDC_Connected() samples the token's raw status instead.
+  intr_mask = USB_SERIAL_JTAG_INTR_SERIAL_IN_EMPTY | USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT | USB_SERIAL_JTAG_INTR_BUS_RESET;
 #ifdef USB_SERIAL_JTAG_DTR_CHG_INT_ENA
   intr_mask |= USB_SERIAL_JTAG_DTR_CHG_INT_ENA | USB_SERIAL_JTAG_RTS_CHG_INT_ENA | USB_SERIAL_JTAG_SET_LINE_CODE_INT_ENA;
 #endif
